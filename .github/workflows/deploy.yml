@@ -1,0 +1,114 @@
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC token for AWS
+  contents: read
+
+env:
+  AWS_REGION:      eu-central-1
+  AWS_ACCOUNT_ID:  "007510598100"
+  ECR_API:         007510598100.dkr.ecr.eu-central-1.amazonaws.com/dersforumu-api
+  ECR_SCRAPER:     007510598100.dkr.ecr.eu-central-1.amazonaws.com/dersforumu-scraper
+  ECS_CLUSTER:     dersforumu
+  ECS_SERVICE:     dersforumu-api
+  ECS_TASK_FAMILY: dersforumu-api
+
+jobs:
+  # ── Build & push container images ──────────────────────────────────────────
+  build:
+    name: Build images
+    runs-on: ubuntu-latest
+    outputs:
+      api_image:     ${{ steps.meta.outputs.api_image }}
+      scraper_image: ${{ steps.meta.outputs.scraper_image }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/gha-dersforumu-deployer
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tags
+        id: meta
+        run: |
+          SHA="${{ github.sha }}"
+          SHORT="${SHA::8}"
+          echo "api_image=${{ env.ECR_API }}:${SHORT}"         >> "$GITHUB_OUTPUT"
+          echo "scraper_image=${{ env.ECR_SCRAPER }}:${SHORT}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push API image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.api_image }}
+            ${{ env.ECR_API }}:latest
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Build & push Scraper image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.scraper
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.scraper_image }}
+            ${{ env.ECR_SCRAPER }}:latest
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+  # ── Deploy API to ECS ───────────────────────────────────────────────────────
+  deploy:
+    name: Deploy API
+    runs-on: ubuntu-latest
+    needs: build
+    # Skip deploy until ECS service exists (Phase 6)
+    # Remove this condition after Phase 6 is applied.
+    if: ${{ vars.ECS_READY == 'true' }}
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/gha-dersforumu-deployer
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch current task definition
+        id: task-def
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_TASK_FAMILY }} \
+            --query taskDefinition \
+            --output json > task-def.json
+
+      - name: Update API container image in task definition
+        id: new-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def.json
+          container-name:  api
+          image:           ${{ needs.build.outputs.api_image }}
+
+      - name: Deploy to ECS service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.new-task-def.outputs.task-definition }}
+          service:         ${{ env.ECS_SERVICE }}
+          cluster:         ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true

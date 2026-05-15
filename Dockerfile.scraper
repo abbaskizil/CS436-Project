@@ -1,0 +1,41 @@
+# ── Stage 1: builder ──────────────────────────────────────────────────────────
+FROM python:3.12-slim AS builder
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libpq-dev gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --upgrade pip \
+    && pip install --prefix=/install --no-cache-dir -r requirements.txt
+
+# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+FROM python:3.12-slim AS runtime
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /install /usr/local
+
+# Copy only what the scraper needs
+COPY suis_scraper.py .
+COPY app/ app/
+COPY alembic/ alembic/
+COPY alembic.ini .
+
+RUN adduser --disabled-password --gecos "" appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
+# Env vars supplied by ECS task definition secrets injection:
+#   DATABASE_URL          — writer connection string (from dersforumu/db/master)
+#   DATABASE_URL_READER   — reader connection string (same on RDS single instance)
+#   SUIS_USERNAME         — from dersforumu/suis/credentials
+#   SUIS_PASSWORD         — from dersforumu/suis/credentials
+
+CMD ["python", "suis_scraper.py"]
